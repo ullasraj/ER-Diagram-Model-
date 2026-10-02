@@ -590,8 +590,16 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
     if (!existing) {
       uniqueEdgesMap.set(pairKey, edge);
     } else {
-      // Favor ManyToOne / owner OneToOne over OneToMany / non-owner
-      if (edge.relationType === 'ManyToOne' || (edge.relationType === 'OneToOne' && edge.sourceColumn)) {
+      // Prioritize OneToOne (1:1) over ManyToOne/OneToMany!
+      if (existing.relationType === 'OneToOne') {
+        // Keep existing OneToOne unless new edge is an owner OneToOne with FK column
+        if (edge.relationType === 'OneToOne' && edge.sourceColumn) {
+          uniqueEdgesMap.set(pairKey, edge);
+        }
+      } else if (edge.relationType === 'OneToOne') {
+        // OneToOne takes precedence over ManyToOne or OneToMany
+        uniqueEdgesMap.set(pairKey, edge);
+      } else if (edge.relationType === 'ManyToOne') {
         uniqueEdgesMap.set(pairKey, edge);
       }
     }
@@ -798,8 +806,8 @@ function parseSqlDDL(code: string, fileName: string, fileId: string): ParsedEnti
           col.isForeignKey = true;
           const relExists = sourceEntity.relations.some(
             (r) =>
-              r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() &&
-              r.fkColumnName === col.dbName
+              r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() ||
+              (r.fkColumnName && r.fkColumnName.toLowerCase() === col.dbName.toLowerCase())
           );
 
           if (!relExists) {
