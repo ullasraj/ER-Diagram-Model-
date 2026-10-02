@@ -85,6 +85,12 @@ function parseSingleEntityFile(
   fileName: string,
   fileId: string
 ): ParsedEntity[] {
+  // If the file is a .sql file or contains CREATE TABLE statements, parse as SQL DDL
+  if (fileName.endsWith('.sql') || /CREATE\s+TABLE/i.test(code)) {
+    const sqlEntities = parseSqlDDL(code, fileName, fileId);
+    if (sqlEntities.length > 0) return sqlEntities;
+  }
+
   const resultEntities: ParsedEntity[] = [];
 
   // Remove single line and multi-line comments for easier regex processing
@@ -329,13 +335,13 @@ function parseRelationDecorator(
   let targetEntity = tsType.replace(/[\[\]\<\>]/g, '').trim();
   let inverseProperty: string | undefined = undefined;
 
-  // Extract target entity function e.g., () => User, (user) => user.posts
+  // Extract target entity function e.g., () => User, (user) => user.posts, 'User'
   if (argsStr) {
     const arrowFnMatches = Array.from(
-      argsStr.matchAll(/\(\)\s*=>\s*([A-Za-z0-9_]+)|type\s*=>\s*([A-Za-z0-9_]+)/g)
+      argsStr.matchAll(/\(\)\s*=>\s*([A-Za-z0-9_]+)|type\s*=>\s*([A-Za-z0-9_]+)|['"`]([A-Za-z0-9_]+)['"`]/g)
     );
-    if (arrowFnMatches.length > 0 && (arrowFnMatches[0][1] || arrowFnMatches[0][2])) {
-      targetEntity = arrowFnMatches[0][1] || arrowFnMatches[0][2];
+    if (arrowFnMatches.length > 0 && (arrowFnMatches[0][1] || arrowFnMatches[0][2] || arrowFnMatches[0][3])) {
+      targetEntity = arrowFnMatches[0][1] || arrowFnMatches[0][2] || arrowFnMatches[0][3];
     }
 
     const inverseMatch = argsStr.match(/\([A-Za-z0-9_]+\)\s*=>\s*[A-Za-z0-9_]+\.([A-Za-z0-9_]+)/);
@@ -390,29 +396,73 @@ function mapTsTypeToDbType(tsType: string): string {
 }
 
 /**
- * Cross-references parsed entities to resolve relationship edges and generate FK columns
+ * Flexible entity lookup helper that matches target entity names by:
+ * 1. Exact className or tableName match (case-insensitive)
+ * 2. Singular / Plural variations (User <-> Users, Category <-> Categories)
+ */
+export function findTargetEntity(
+  targetName: string,
+  entities: ParsedEntity[]
+): ParsedEntity | undefined {
+  if (!targetName) return undefined;
+  const nameLower = targetName.toLowerCase();
+
+  // 1. Direct match on className or tableName
+  let found = entities.find(
+    (e) => e.className.toLowerCase() === nameLower || e.tableName.toLowerCase() === nameLower
+  );
+  if (found) return found;
+
+  // 2. Singular / Plural variations
+  const variations: string[] = [];
+
+  if (nameLower.endsWith('s')) {
+    variations.push(nameLower.slice(0, -1)); // e.g. users -> user
+  } else {
+    variations.push(nameLower + 's'); // e.g. user -> users
+  }
+
+  if (nameLower.endsWith('es')) {
+    variations.push(nameLower.slice(0, -2)); // e.g. buses -> bus
+  } else {
+    variations.push(nameLower + 'es');
+  }
+
+  if (nameLower.endsWith('ies')) {
+    variations.push(nameLower.slice(0, -3) + 'y'); // e.g. categories -> category
+  } else if (nameLower.endsWith('y')) {
+    variations.push(nameLower.slice(0, -1) + 'ies'); // e.g. category -> categories
+  }
+
+  for (const varName of variations) {
+    found = entities.find(
+      (e) => e.className.toLowerCase() === varName || e.tableName.toLowerCase() === varName
+    );
+    if (found) return found;
+  }
+
+  return undefined;
+}
+
+/**
+ * Cross-references parsed entities to resolve relationship edges and generate FK columns.
+ * Ensures exactly ONE clean edge per entity pair between tables.
  */
 function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshipEdge[] {
   const edges: EntityRelationshipEdge[] = [];
-  const entityMap = new Map<string, ParsedEntity>();
-
-  entities.forEach((ent) => {
-    entityMap.set(ent.className, ent);
-  });
 
   entities.forEach((sourceEntity) => {
     sourceEntity.relations.forEach((rel) => {
-      const targetEntity = entityMap.get(rel.targetEntity);
+      const targetEntity = findTargetEntity(rel.targetEntity, entities);
+      const targetClassName = targetEntity ? targetEntity.className : rel.targetEntity;
 
       if (rel.relationType === 'ManyToOne') {
-        // ManyToOne creates a Foreign Key in source table pointing to target table
         const fkColName = rel.fkColumnName || `${rel.propertyName}Id`;
         let existingCol = sourceEntity.columns.find(
           (c) => c.name === fkColName || c.dbName === fkColName
         );
 
         if (!existingCol) {
-          // Auto create foreign key column representation
           existingCol = {
             id: `fk-${sourceEntity.className}-${fkColName}`,
             name: fkColName,
@@ -427,7 +477,7 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
             isUnique: false,
             isForeignKey: true,
             foreignKeyTarget: {
-              entityName: rel.targetEntity,
+              entityName: targetClassName,
               columnName: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
               relationType: 'ManyToOne',
             },
@@ -436,39 +486,50 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
         } else {
           existingCol.isForeignKey = true;
           existingCol.foreignKeyTarget = {
-            entityName: rel.targetEntity,
+            entityName: targetClassName,
             columnName: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
             relationType: 'ManyToOne',
           };
         }
 
-        edges.push({
-          id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
+        const existingIdx = edges.findIndex(
+          (e) =>
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === targetClassName) ||
+            (e.sourceEntity === targetClassName && e.targetEntity === sourceEntity.className)
+        );
+
+        const newEdge: EntityRelationshipEdge = {
+          id: `edge-${sourceEntity.className}-${rel.propertyName}-${targetClassName}`,
           sourceEntity: sourceEntity.className,
           sourceColumn: fkColName,
-          targetEntity: rel.targetEntity,
+          targetEntity: targetClassName,
           targetColumn: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
           relationType: 'ManyToOne',
           cardinalityLabel: 'N : 1',
           sourceProperty: rel.propertyName,
           targetProperty: rel.inverseProperty,
-        });
+        };
+
+        if (existingIdx !== -1) {
+          if (edges[existingIdx].relationType !== 'OneToOne') {
+            edges[existingIdx] = newEdge;
+          }
+        } else {
+          edges.push(newEdge);
+        }
       } else if (rel.relationType === 'OneToMany') {
-        // OneToMany is inverse side of ManyToOne
-        // Only add edge if inverse edge isn't already added to prevent duplicate visual lines
-        const hasExistingManyToOne = edges.some(
+        const existingEdge = edges.find(
           (e) =>
-            e.sourceEntity === rel.targetEntity &&
-            e.targetEntity === sourceEntity.className &&
-            e.relationType === 'ManyToOne'
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === targetClassName) ||
+            (e.sourceEntity === targetClassName && e.targetEntity === sourceEntity.className)
         );
 
-        if (!hasExistingManyToOne) {
+        if (!existingEdge) {
           edges.push({
-            id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
+            id: `edge-${sourceEntity.className}-${rel.propertyName}-${targetClassName}`,
             sourceEntity: sourceEntity.className,
             sourceColumn: sourceEntity.columns.find((c) => c.isPrimary)?.dbName || 'id',
-            targetEntity: rel.targetEntity,
+            targetEntity: targetClassName,
             targetColumn: `${rel.inverseProperty || sourceEntity.className.toLowerCase()}Id`,
             relationType: 'OneToMany',
             cardinalityLabel: '1 : N',
@@ -499,7 +560,7 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
               isUnique: true,
               isForeignKey: true,
               foreignKeyTarget: {
-                entityName: rel.targetEntity,
+                entityName: targetClassName,
                 columnName: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
                 relationType: 'OneToOne',
               },
@@ -508,44 +569,55 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
           } else {
             existingCol.isForeignKey = true;
             existingCol.isUnique = true;
+            existingCol.foreignKeyTarget = {
+              entityName: targetClassName,
+              columnName: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
+              relationType: 'OneToOne',
+            };
           }
         }
 
-        const edgeExists = edges.some(
+        const existingIdx = edges.findIndex(
           (e) =>
-            (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
-            (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === targetClassName) ||
+            (e.sourceEntity === targetClassName && e.targetEntity === sourceEntity.className)
         );
 
-        if (!edgeExists) {
-          edges.push({
-            id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
-            sourceEntity: sourceEntity.className,
-            sourceColumn: fkColName,
-            targetEntity: rel.targetEntity,
-            targetColumn: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
-            relationType: 'OneToOne',
-            cardinalityLabel: '1 : 1',
-            sourceProperty: rel.propertyName,
-            targetProperty: rel.inverseProperty,
-          });
+        const oneToOneEdge: EntityRelationshipEdge = {
+          id: `edge-${sourceEntity.className}-${rel.propertyName}-${targetClassName}`,
+          sourceEntity: sourceEntity.className,
+          sourceColumn: isOwner ? fkColName : undefined,
+          targetEntity: targetClassName,
+          targetColumn: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
+          relationType: 'OneToOne',
+          cardinalityLabel: '1 : 1',
+          sourceProperty: rel.propertyName,
+          targetProperty: rel.inverseProperty,
+        };
+
+        if (existingIdx !== -1) {
+          if (edges[existingIdx].relationType !== 'OneToOne' || isOwner) {
+            edges[existingIdx] = oneToOneEdge;
+          }
+        } else {
+          edges.push(oneToOneEdge);
         }
       } else if (rel.relationType === 'ManyToMany') {
-        const edgeExists = edges.some(
+        const existingEdge = edges.find(
           (e) =>
-            (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
-            (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === targetClassName) ||
+            (e.sourceEntity === targetClassName && e.targetEntity === sourceEntity.className)
         );
 
-        if (!edgeExists) {
+        if (!existingEdge) {
           const joinTable =
             rel.joinTableName ||
-            `${sourceEntity.tableName}_${(rel.targetEntity).toLowerCase()}`;
+            `${sourceEntity.tableName}_${targetClassName.toLowerCase()}`;
 
           edges.push({
-            id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
+            id: `edge-${sourceEntity.className}-${rel.propertyName}-${targetClassName}`,
             sourceEntity: sourceEntity.className,
-            targetEntity: rel.targetEntity,
+            targetEntity: targetClassName,
             relationType: 'ManyToMany',
             cardinalityLabel: 'N : M',
             sourceProperty: rel.propertyName,
@@ -557,5 +629,266 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
     });
   });
 
-  return edges;
+  // Final Strict Deduplication Pass: Ensure max 1 edge per pair of entities
+  const uniqueEdgesMap = new Map<string, EntityRelationshipEdge>();
+
+  edges.forEach((edge) => {
+    const pairKey = [edge.sourceEntity, edge.targetEntity].sort().join('::');
+    const existing = uniqueEdgesMap.get(pairKey);
+
+    if (!existing) {
+      uniqueEdgesMap.set(pairKey, edge);
+    } else {
+      if (existing.relationType === 'OneToOne') {
+        if (edge.relationType === 'OneToOne' && edge.sourceColumn) {
+          uniqueEdgesMap.set(pairKey, edge);
+        }
+      } else if (edge.relationType === 'OneToOne') {
+        uniqueEdgesMap.set(pairKey, edge);
+      } else if (edge.relationType === 'ManyToOne') {
+        uniqueEdgesMap.set(pairKey, edge);
+      }
+    }
+  });
+
+  return Array.from(uniqueEdgesMap.values());
 }
+
+/**
+ * SQL DDL Schema Parser for .sql files
+ */
+function parseSqlDDL(code: string, fileName: string, fileId: string): ParsedEntity[] {
+  const cleanCode = code
+    .replace(/--.*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+
+  const entities: ParsedEntity[] = [];
+  const createTableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["`]?([A-Za-z0-9_.]+)(?:["`]?))\s*\(([\s\S]*?)\);/gi;
+
+  let match;
+  while ((match = createTableRegex.exec(cleanCode)) !== null) {
+    const rawTableName = match[1].replace(/["`]/g, '');
+    const tableName = rawTableName.includes('.') ? rawTableName.split('.').pop()! : rawTableName;
+    const tableBody = match[2];
+
+    const className = tableName
+      .replace(/^[a-z]/, (c) => c.toUpperCase())
+      .replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+    const columns: ParsedColumn[] = [];
+    const relations: ParsedRelation[] = [];
+    const pkColumns: string[] = [];
+
+    const lines = splitSqlColumns(tableBody);
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      // Table Constraint: PRIMARY KEY (col1, col2)
+      const pkMatch = trimmed.match(/^PRIMARY\s+KEY\s*\(([^)]+)\)/i);
+      if (pkMatch) {
+        const cols = pkMatch[1].split(',').map((c) => c.trim().replace(/["`]/g, ''));
+        pkColumns.push(...cols);
+        continue;
+      }
+
+      // Table Constraint: FOREIGN KEY (col) REFERENCES target_table(target_col)
+      const fkMatch = trimmed.match(/^(?:CONSTRAINT\s+["`]?\w+["`]?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/i);
+      if (fkMatch) {
+        const fkCol = fkMatch[1].trim().replace(/["`]/g, '');
+        const targetTable = fkMatch[2].trim().replace(/["`]/g, '');
+        const targetClass = targetTable.replace(/^[a-z]/, (c) => c.toUpperCase()).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+        const isUniqueCol = columns.some((c) => c.dbName.toLowerCase() === fkCol.toLowerCase() && c.isUnique);
+
+        relations.push({
+          id: `${fileId}-${className}-${fkCol}`,
+          propertyName: fkCol.replace(/_id$/i, ''),
+          relationType: isUniqueCol ? 'OneToOne' : 'ManyToOne',
+          targetEntity: targetClass,
+          fkColumnName: fkCol,
+          isOwner: true,
+        });
+        continue;
+      }
+
+      // Column Definition line: e.g. "id UUID PRIMARY KEY"
+      const colRegex = /^["`]?([A-Za-z0-9_]+)["`]?\s+([A-Za-z0-9_()]+)([\s\S]*)$/i;
+      const colMatch = trimmed.match(colRegex);
+      if (colMatch) {
+        const dbName = colMatch[1];
+        const rawType = colMatch[2];
+        const rest = colMatch[3] || '';
+
+        // Ignore table constraints matched by colRegex
+        if (['PRIMARY', 'FOREIGN', 'CONSTRAINT', 'KEY', 'UNIQUE', 'CHECK'].includes(dbName.toUpperCase())) {
+          continue;
+        }
+
+        const isPrimaryInline = /PRIMARY\s+KEY/i.test(rest);
+        const isNullableInline = !/NOT\s+NULL/i.test(rest) && !isPrimaryInline;
+        const isUniqueInline = /UNIQUE/i.test(rest);
+        const isGeneratedInline = /SERIAL|AUTO_INCREMENT|gen_random_uuid/i.test(rawType + rest);
+
+        const inlineFkMatch = rest.match(/REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/i);
+        if (inlineFkMatch) {
+          const targetTable = inlineFkMatch[1].replace(/["`]/g, '');
+          const targetClass = targetTable.replace(/^[a-z]/, (c) => c.toUpperCase()).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+          relations.push({
+            id: `${fileId}-${className}-${dbName}`,
+            propertyName: dbName.replace(/_id$/i, ''),
+            relationType: isUniqueInline ? 'OneToOne' : 'ManyToOne',
+            targetEntity: targetClass,
+            fkColumnName: dbName,
+            isOwner: true,
+          });
+        }
+
+        columns.push({
+          id: `${fileId}-${className}-${dbName}`,
+          name: dbName,
+          dbName,
+          type: rawType.toLowerCase(),
+          tsType: mapSqlToTsType(rawType),
+          isPrimary: isPrimaryInline,
+          isGenerated: isGeneratedInline,
+          isNullable: isNullableInline,
+          isUnique: isUniqueInline,
+          isForeignKey: Boolean(inlineFkMatch),
+        });
+      }
+    }
+
+    if (pkColumns.length > 0) {
+      columns.forEach((c) => {
+        if (pkColumns.includes(c.dbName)) {
+          c.isPrimary = true;
+          c.isNullable = false;
+        }
+      });
+    }
+
+    entities.push({
+      id: `${fileId}-${className}`,
+      fileName,
+      className,
+      tableName,
+      columns,
+      relations,
+      rawCode: code,
+    });
+  }
+
+  // Parse standalone ALTER TABLE ... FOREIGN KEY ... REFERENCES ...
+  const alterFkRegex = /ALTER\s+TABLE\s+(?:ONLY\s+)?["`]?([A-Za-z0-9_.]+)(?:["`]?)\s+ADD\s+(?:CONSTRAINT\s+["`]?\w+["`]?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/gi;
+
+  let alterMatch;
+  while ((alterMatch = alterFkRegex.exec(cleanCode)) !== null) {
+    const sourceTable = alterMatch[1].replace(/["`]/g, '').split('.').pop()!;
+    const fkCol = alterMatch[2].replace(/["`]/g, '').trim();
+    const targetTable = alterMatch[3].replace(/["`]/g, '').split('.').pop()!;
+
+    const sourceEntity = findTargetEntity(sourceTable, entities);
+    const targetEntity = findTargetEntity(targetTable, entities);
+
+    if (sourceEntity && targetEntity) {
+      const col = sourceEntity.columns.find((c) => c.dbName.toLowerCase() === fkCol.toLowerCase());
+      if (col) {
+        col.isForeignKey = true;
+      }
+      const isUniqueCol = col ? col.isUnique : false;
+
+      const relExists = sourceEntity.relations.some(
+        (r) =>
+          r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() &&
+          r.fkColumnName === fkCol
+      );
+
+      if (!relExists) {
+        sourceEntity.relations.push({
+          id: `${fileId}-${sourceEntity.className}-${fkCol}`,
+          propertyName: fkCol.replace(/_id$/i, ''),
+          relationType: isUniqueCol ? 'OneToOne' : 'ManyToOne',
+          targetEntity: targetEntity.className,
+          fkColumnName: fkCol,
+          isOwner: true,
+        });
+      }
+    }
+  }
+
+  // Auto-infer implied foreign keys from column names (e.g. user_id -> User)
+  entities.forEach((sourceEntity) => {
+    sourceEntity.columns.forEach((col) => {
+      if (col.isPrimary) return;
+
+      const colNameLower = col.dbName.toLowerCase();
+      let inferredTargetName = '';
+
+      if (colNameLower.endsWith('_id')) {
+        inferredTargetName = colNameLower.replace(/_id$/, '');
+      } else if (colNameLower.endsWith('id') && colNameLower.length > 2) {
+        inferredTargetName = colNameLower.substring(0, colNameLower.length - 2);
+      }
+
+      if (inferredTargetName) {
+        const targetEntity = findTargetEntity(inferredTargetName, entities);
+
+        if (targetEntity && targetEntity !== sourceEntity) {
+          col.isForeignKey = true;
+          const isUniqueCol = col.isUnique;
+
+          const relExists = sourceEntity.relations.some(
+            (r) =>
+              r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() ||
+              (r.fkColumnName && r.fkColumnName.toLowerCase() === col.dbName.toLowerCase())
+          );
+
+          if (!relExists) {
+            sourceEntity.relations.push({
+              id: `${fileId}-${sourceEntity.className}-${col.dbName}`,
+              propertyName: col.dbName.replace(/_id$/i, ''),
+              relationType: isUniqueCol ? 'OneToOne' : 'ManyToOne',
+              targetEntity: targetEntity.className,
+              fkColumnName: col.dbName,
+              isOwner: true,
+            });
+          }
+        }
+      }
+    });
+  });
+
+  return entities;
+}
+
+function splitSqlColumns(tableBody: string): string[] {
+  const results: string[] = [];
+  let current = '';
+  let parenDepth = 0;
+
+  for (let i = 0; i < tableBody.length; i++) {
+    const char = tableBody[i];
+    if (char === '(') parenDepth++;
+    else if (char === ')') parenDepth--;
+
+    if (char === ',' && parenDepth === 0) {
+      results.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  if (current.trim()) results.push(current);
+  return results;
+}
+
+function mapSqlToTsType(sqlType: string): string {
+  const lower = sqlType.toLowerCase();
+  if (lower.includes('int') || lower.includes('numeric') || lower.includes('decimal') || lower.includes('float')) return 'number';
+  if (lower.includes('bool')) return 'boolean';
+  if (lower.includes('date') || lower.includes('time')) return 'Date';
+  return 'string';
+}
+
+

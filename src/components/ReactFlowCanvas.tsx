@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState, useRef } from 'react';
 import {
   ReactFlow,
   Background,
@@ -16,6 +16,7 @@ import type { Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
 import type { ParsedEntity, EntityRelationshipEdge } from '../utils/typeormParser';
+import { getEntityColor } from '../utils/colorUtils';
 import { EntityNode } from './EntityNode';
 import { RelationEdge } from './RelationEdge';
 import {
@@ -30,6 +31,12 @@ import {
   Upload,
   Sparkles,
   Layers,
+  Palette,
+  CheckSquare,
+  Square,
+  ChevronDown,
+  X,
+  Table,
 } from 'lucide-react';
 
 interface ReactFlowCanvasProps {
@@ -53,7 +60,8 @@ const edgeTypes = {
 function getDagreLayout(
   entities: ParsedEntity[],
   relationshipEdges: EntityRelationshipEdge[],
-  direction: 'TB' | 'LR' = 'TB'
+  direction: 'TB' | 'LR' = 'TB',
+  colorMode: 'table' | 'relation' = 'table'
 ): { nodes: Node[]; edges: Edge[] } {
   const dagreGraph = new dagre.graphlib.Graph();
   dagreGraph.setDefaultEdgeLabel(() => ({}));
@@ -73,11 +81,13 @@ function getDagreLayout(
     return 150 + ent.columns.length * 36;
   };
 
-  entities.forEach((ent) => {
-    const height = calculateNodeHeight(ent);
+  const entityColorMap = new Map<string, ReturnType<typeof getEntityColor>>();
+  entities.forEach((ent, idx) => {
+    const colorTheme = getEntityColor(ent.className, idx);
+    entityColorMap.set(ent.className, colorTheme);
     dagreGraph.setNode(ent.className, {
       width: isHorizontal ? nodeWidth + 40 : nodeWidth,
-      height: isHorizontal ? height + 20 : height,
+      height: calculateNodeHeight(ent),
     });
   });
 
@@ -87,15 +97,17 @@ function getDagreLayout(
 
   dagre.layout(dagreGraph);
 
-  const nodes: Node[] = entities.map((ent) => {
+  const nodes: Node[] = entities.map((ent, idx) => {
     const nodeWithPosition = dagreGraph.node(ent.className);
     const height = calculateNodeHeight(ent);
+    const colorTheme = entityColorMap.get(ent.className) || getEntityColor(ent.className, idx);
 
     return {
       id: ent.className,
       type: 'entityNode',
       data: {
         entity: ent,
+        colorTheme,
       },
       position: {
         x: nodeWithPosition ? nodeWithPosition.x - nodeWidth / 2 : Math.random() * 400,
@@ -108,9 +120,14 @@ function getDagreLayout(
     const isManyToMany = relEdge.relationType === 'ManyToMany';
     const isOneToOne = relEdge.relationType === 'OneToOne';
 
-    let strokeColor = '#818cf8';
-    if (isManyToMany) strokeColor = '#f472b6';
-    if (isOneToOne) strokeColor = '#38bdf8';
+    const sourceTheme = entityColorMap.get(relEdge.sourceEntity) || getEntityColor(relEdge.sourceEntity);
+
+    let strokeColor = sourceTheme.stroke;
+    if (colorMode === 'relation') {
+      strokeColor = '#818cf8';
+      if (isManyToMany) strokeColor = '#f472b6';
+      if (isOneToOne) strokeColor = '#38bdf8';
+    }
 
     return {
       id: relEdge.id,
@@ -121,6 +138,10 @@ function getDagreLayout(
         cardinalityLabel: relEdge.cardinalityLabel,
         relationType: relEdge.relationType,
         sourceProperty: relEdge.sourceProperty,
+        edgeColor: strokeColor,
+        edgeTextColor: colorMode === 'table' ? sourceTheme.text : undefined,
+        edgeBgColor: colorMode === 'table' ? sourceTheme.bg : undefined,
+        edgeBorderColor: colorMode === 'table' ? sourceTheme.border : undefined,
       },
       markerEnd: {
         type: MarkerType.ArrowClosed,
@@ -149,24 +170,54 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
 }) => {
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedTableClasses, setSelectedTableClasses] = useState<string[]>([]);
+  const [tableSearchText, setTableSearchText] = useState('');
+  const [showTablePickerDropdown, setShowTablePickerDropdown] = useState(false);
   const [selectedRelationFilter, setSelectedRelationFilter] = useState<string>('all');
   const [layoutDirection, setLayoutDirection] = useState<'TB' | 'LR'>('TB');
+  const [colorMode, setColorMode] = useState<'table' | 'relation'>('table');
   const [bgVariant, setBgVariant] = useState<BackgroundVariant>(BackgroundVariant.Dots);
+  const dropdownRef = useRef<HTMLDivElement>(null);
   const { fitView } = useReactFlow();
 
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as unknown as globalThis.Node)) {
+        setShowTablePickerDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   const applyLayout = useCallback(
-    (direction: 'TB' | 'LR' = layoutDirection) => {
+    (direction: 'TB' | 'LR' = layoutDirection, mode: 'table' | 'relation' = colorMode) => {
       if (entities.length === 0) {
         setNodes([]);
         setEdges([]);
         return;
       }
-      const { nodes: layoutNodes, edges: layoutEdges } = getDagreLayout(
-        entities,
-        relationshipEdges,
-        direction
+
+      // Filter entities & edges to only selected tables if a selection filter is active
+      const activeEntities =
+        selectedTableClasses.length > 0
+          ? entities.filter((e) => selectedTableClasses.includes(e.className))
+          : entities;
+
+      const activeNodeIds = new Set(activeEntities.map((e) => e.className));
+
+      const activeRelationshipEdges = relationshipEdges.filter(
+        (e) => activeNodeIds.has(e.sourceEntity) && activeNodeIds.has(e.targetEntity)
       );
+
+      const { nodes: layoutNodes, edges: layoutEdges } = getDagreLayout(
+        activeEntities,
+        activeRelationshipEdges,
+        direction,
+        mode
+      );
+
       setNodes(layoutNodes);
       setEdges(layoutEdges);
 
@@ -174,12 +225,12 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         fitView({ padding: 0.2, duration: 400 });
       }, 50);
     },
-    [entities, relationshipEdges, layoutDirection, fitView, setNodes, setEdges]
+    [entities, relationshipEdges, selectedTableClasses, layoutDirection, colorMode, fitView, setNodes, setEdges]
   );
 
   useEffect(() => {
-    applyLayout(layoutDirection);
-  }, [entities, relationshipEdges, layoutDirection, applyLayout]);
+    applyLayout(layoutDirection, colorMode);
+  }, [entities, relationshipEdges, selectedTableClasses, layoutDirection, colorMode, applyLayout]);
 
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
     const ent = entities.find((e) => e.className === node.id);
@@ -191,39 +242,54 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
     setLayoutDirection(nextDir);
   };
 
+  const toggleColorMode = () => {
+    const nextMode = colorMode === 'table' ? 'relation' : 'table';
+    setColorMode(nextMode);
+  };
+
   const toggleBgVariant = () => {
     if (bgVariant === BackgroundVariant.Dots) setBgVariant(BackgroundVariant.Lines);
     else if (bgVariant === BackgroundVariant.Lines) setBgVariant(BackgroundVariant.Cross);
     else setBgVariant(BackgroundVariant.Dots);
   };
 
-  const filteredNodes = nodes.map((n) => {
-    const ent = n.data?.entity as ParsedEntity;
-    const isMatch =
-      !searchTerm ||
-      ent?.className.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      ent?.tableName.toLowerCase().includes(searchTerm.toLowerCase());
+  // Multi-table selection handlers
+  const handleToggleTableSelection = (className: string) => {
+    setSelectedTableClasses((prev) => {
+      if (prev.includes(className)) {
+        return prev.filter((c) => c !== className);
+      } else {
+        return [...prev, className];
+      }
+    });
+  };
 
-    return {
-      ...n,
-      data: {
-        ...n.data,
-        isHighlighted: isMatch && searchTerm.length > 0,
-        onSelectEntity,
-      },
-      style: {
-        opacity: searchTerm && !isMatch ? 0.25 : 1,
-        transition: 'all 0.3s ease',
-      },
-    };
+  const handleSelectAllTables = () => {
+    setSelectedTableClasses(entities.map((e) => e.className));
+  };
+
+  const handleClearTableSelection = () => {
+    setSelectedTableClasses([]);
+  };
+
+  // Nodes are already filtered and laid out compactly by applyLayout
+  const visibleNodes = nodes;
+
+  // Filter edges so relationship lines match the selected relation filter
+  const visibleEdges = edges.filter((e) => {
+    // Edge relation type filter
+    if (selectedRelationFilter !== 'all' && e.data?.relationType !== selectedRelationFilter) {
+      return false;
+    }
+    return true;
   });
 
-  const filteredEdges = edges.filter((e) => {
-    if (selectedRelationFilter === 'all') return true;
-    return e.data?.relationType === selectedRelationFilter;
-  });
+  const searchedEntities = entities.filter(
+    (e) =>
+      e.className.toLowerCase().includes(tableSearchText.toLowerCase()) ||
+      e.tableName.toLowerCase().includes(tableSearchText.toLowerCase())
+  );
 
-  // Empty State Canvas Overlay
   if (entities.length === 0) {
     return (
       <div className="w-full h-full relative bg-slate-950 flex items-center justify-center p-6 select-none">
@@ -268,8 +334,8 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
   return (
     <div className="w-full h-full relative bg-slate-950">
       <ReactFlow
-        nodes={filteredNodes}
-        edges={filteredEdges}
+        nodes={visibleNodes}
+        edges={visibleEdges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
@@ -284,23 +350,135 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         <Background variant={bgVariant} color="#334155" gap={24} size={1} />
         <Controls className="!bg-slate-900/90 !border-slate-800 !text-slate-200 !rounded-2xl !shadow-2xl overflow-hidden backdrop-blur-md" />
         <MiniMap
-          nodeColor={() => '#6366f1'}
+          nodeColor={(node) => {
+            const ent = node.data?.entity as ParsedEntity;
+            if (ent) {
+              const theme = getEntityColor(ent.className);
+              return theme.stroke;
+            }
+            return '#6366f1';
+          }}
           maskColor="rgba(9, 13, 22, 0.85)"
           className="!bg-slate-900/90 !border-slate-800 !rounded-2xl overflow-hidden shadow-2xl backdrop-blur-md"
         />
 
         {/* Top Floating Controls Panel */}
         <Panel position="top-left" className="flex flex-wrap items-center gap-2.5">
-          {/* Search Input */}
-          <div className="relative bg-slate-900/90 backdrop-blur-md border border-slate-800 rounded-xl shadow-xl flex items-center px-3 py-1.5 text-xs">
-            <Search className="w-3.5 h-3.5 text-slate-400 mr-2" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Search table..."
-              className="bg-transparent border-none outline-none text-slate-200 placeholder-slate-500 w-32 md:w-44 text-xs"
-            />
+          {/* Multi-Select Table Picker Dropdown Button */}
+          <div className="relative" ref={dropdownRef}>
+            <button
+              onClick={() => setShowTablePickerDropdown(!showTablePickerDropdown)}
+              className={`flex items-center gap-2 px-3 py-1.5 backdrop-blur-md border rounded-xl shadow-xl text-xs font-semibold transition-all ${
+                selectedTableClasses.length > 0
+                  ? 'bg-indigo-600 text-white border-indigo-500 shadow-indigo-600/25'
+                  : 'bg-slate-900/90 hover:bg-slate-800 border-slate-800 text-slate-200'
+              }`}
+            >
+              <Table className="w-3.5 h-3.5 text-indigo-300" />
+              <span>
+                {selectedTableClasses.length > 0
+                  ? `Showing ${selectedTableClasses.length} of ${entities.length} Tables`
+                  : `Select Tables (${entities.length})`}
+              </span>
+              <ChevronDown className="w-3.5 h-3.5 opacity-70" />
+            </button>
+
+            {/* Dropdown Menu */}
+            {showTablePickerDropdown && (
+              <div className="absolute top-full left-0 mt-2 w-72 bg-slate-900/98 border border-slate-700/90 rounded-2xl shadow-2xl z-50 p-3 backdrop-blur-2xl animate-in fade-in duration-150 space-y-2.5">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                    <Table className="w-4 h-4 text-indigo-400" /> Multi-Table Picker
+                  </span>
+                  <div className="flex items-center gap-2 text-[11px]">
+                    <button
+                      onClick={handleSelectAllTables}
+                      className="text-indigo-400 hover:text-indigo-300 font-medium"
+                    >
+                      Select All
+                    </button>
+                    <span className="text-slate-600">|</span>
+                    <button
+                      onClick={handleClearTableSelection}
+                      className="text-slate-400 hover:text-slate-200"
+                    >
+                      Show All
+                    </button>
+                  </div>
+                </div>
+
+                {/* Search box inside table picker */}
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-500" />
+                  <input
+                    type="text"
+                    value={tableSearchText}
+                    onChange={(e) => setTableSearchText(e.target.value)}
+                    placeholder="Search table list..."
+                    className="w-full pl-8 pr-2 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  />
+                  {tableSearchText && (
+                    <button
+                      onClick={() => setTableSearchText('')}
+                      className="absolute right-2 top-2 text-slate-400 hover:text-slate-200"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Checkbox List of Tables */}
+                <div className="max-h-60 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
+                  {searchedEntities.map((ent, idx) => {
+                    const isChecked = selectedTableClasses.includes(ent.className);
+                    const colorTheme = getEntityColor(ent.className, idx);
+
+                    return (
+                      <div
+                        key={ent.className}
+                        onClick={() => handleToggleTableSelection(ent.className)}
+                        className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs font-mono cursor-pointer transition-colors border ${
+                          isChecked
+                            ? 'bg-indigo-950/60 border-indigo-500/50 text-slate-100 font-semibold'
+                            : 'bg-slate-950/40 border-slate-800/80 hover:bg-slate-800/60 text-slate-300'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate">
+                          {isChecked ? (
+                            <CheckSquare className="w-4 h-4 text-indigo-400 shrink-0" />
+                          ) : (
+                            <Square className="w-4 h-4 text-slate-600 shrink-0" />
+                          )}
+                          <span
+                            className="w-2.5 h-2.5 rounded-full shrink-0 border"
+                            style={{ backgroundColor: colorTheme.stroke, borderColor: colorTheme.stroke }}
+                          />
+                          <span className="truncate">{ent.className}</span>
+                        </div>
+                        <span className="text-[10px] text-slate-500 font-sans shrink-0 ml-2">
+                          ({ent.tableName})
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {searchedEntities.length === 0 && (
+                    <p className="text-xs text-slate-500 text-center py-3">No tables match "{tableSearchText}"</p>
+                  )}
+                </div>
+
+                {selectedTableClasses.length > 0 && (
+                  <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-400">
+                    <span>{selectedTableClasses.length} tables selected</span>
+                    <button
+                      onClick={handleClearTableSelection}
+                      className="text-xs text-indigo-400 hover:text-indigo-300 font-medium"
+                    >
+                      Reset Filter
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Relation Filter */}
@@ -328,6 +506,16 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
               </option>
             </select>
           </div>
+
+          {/* Color Mode Toggle */}
+          <button
+            onClick={toggleColorMode}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900/90 hover:bg-slate-800 backdrop-blur-md text-xs font-medium text-slate-200 border border-slate-800 rounded-xl shadow-xl transition-all"
+            title="Toggle between Distinct Table Line Colors and Relation Type Colors"
+          >
+            <Palette className="w-3.5 h-3.5 text-amber-400" />
+            <span>{colorMode === 'table' ? 'Colors: Distinct Tables' : 'Colors: Relation Types'}</span>
+          </button>
 
           {/* Layout Direction Toggle */}
           <button
@@ -372,17 +560,37 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         </Panel>
 
         {/* Bottom Right Relation Legend */}
-        <Panel position="bottom-right" className="hidden md:flex items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800 px-3.5 py-1.5 rounded-xl shadow-xl text-[11px] font-mono text-slate-300">
-          <span className="text-slate-400">Legend:</span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-indigo-500"></span> N:1 / 1:N
+        <Panel position="bottom-right" className="hidden md:flex flex-wrap items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800 px-3.5 py-1.5 rounded-xl shadow-xl text-[11px] font-mono text-slate-300 max-w-xl">
+          <span className="text-slate-400 font-sans font-medium">
+            {colorMode === 'table' ? 'Table Connection Colors:' : 'Relation Type Colors:'}
           </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span> 1:1
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-pink-400"></span> N:M
-          </span>
+
+          {colorMode === 'table' ? (
+            entities.slice(0, 6).map((ent, idx) => {
+              const theme = getEntityColor(ent.className, idx);
+              return (
+                <span key={ent.id} className="flex items-center gap-1">
+                  <span
+                    className="w-2.5 h-2.5 rounded-full border"
+                    style={{ backgroundColor: theme.stroke, borderColor: theme.stroke }}
+                  />
+                  <span style={{ color: theme.text }}>{ent.className}</span>
+                </span>
+              );
+            })
+          ) : (
+            <>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-indigo-500"></span> N:1 / 1:N
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span> 1:1
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-pink-400"></span> N:M
+              </span>
+            </>
+          )}
         </Panel>
       </ReactFlow>
     </div>

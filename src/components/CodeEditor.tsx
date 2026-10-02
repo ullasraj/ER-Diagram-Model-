@@ -58,11 +58,36 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     if (!uploadedFiles) return;
 
     Array.from(uploadedFiles).forEach((file) => {
-      if (file.name.endsWith('.ts') || file.name.endsWith('.js') || file.name.endsWith('.txt')) {
+      const isCodeOrSql =
+        file.name.endsWith('.ts') ||
+        file.name.endsWith('.js') ||
+        file.name.endsWith('.sql') ||
+        file.name.endsWith('.txt');
+
+      if (isCodeOrSql) {
         const reader = new FileReader();
         reader.onload = (event) => {
           const content = event.target?.result as string;
           onAddFile(file.name, content);
+        };
+        reader.readAsText(file);
+      } else if (file.name.endsWith('.json')) {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const content = event.target?.result as string;
+            const parsed = JSON.parse(content);
+            const items = Array.isArray(parsed) ? parsed : parsed.files;
+            if (Array.isArray(items)) {
+              items.forEach((item: any) => {
+                if (item.fileName && item.code) {
+                  onAddFile(item.fileName, item.code);
+                }
+              });
+            }
+          } catch (err) {
+            console.error('Failed to parse JSON model:', err);
+          }
         };
         reader.readAsText(file);
       }
@@ -75,11 +100,36 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     if (!droppedFiles) return;
 
     Array.from(droppedFiles).forEach((file) => {
-      if (file.name.endsWith('.ts') || file.name.endsWith('.js') || file.name.endsWith('.txt')) {
+      const isCodeOrSql =
+        file.name.endsWith('.ts') ||
+        file.name.endsWith('.js') ||
+        file.name.endsWith('.sql') ||
+        file.name.endsWith('.txt');
+
+      if (isCodeOrSql) {
         const reader = new FileReader();
         reader.onload = (event) => {
           const content = event.target?.result as string;
           onAddFile(file.name, content);
+        };
+        reader.readAsText(file);
+      } else if (file.name.endsWith('.json')) {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const content = event.target?.result as string;
+            const parsed = JSON.parse(content);
+            const items = Array.isArray(parsed) ? parsed : parsed.files;
+            if (Array.isArray(items)) {
+              items.forEach((item: any) => {
+                if (item.fileName && item.code) {
+                  onAddFile(item.fileName, item.code);
+                }
+              });
+            }
+          } catch (err) {
+            console.error('Failed to parse JSON model:', err);
+          }
         };
         reader.readAsText(file);
       }
@@ -122,13 +172,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
             <label
               className="flex items-center gap-1 px-2.5 py-1 text-xs bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-lg cursor-pointer transition-colors"
-              title="Upload .ts / .js files"
+              title="Upload .ts / .js / .sql / .json files"
             >
               <Upload className="w-3.5 h-3.5" /> Upload
               <input
                 type="file"
                 multiple
-                accept=".ts,.js,.txt"
+                accept=".ts,.js,.sql,.json,.txt"
                 onChange={handleFileUpload}
                 className="hidden"
               />
