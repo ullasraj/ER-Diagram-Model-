@@ -396,7 +396,8 @@ function mapTsTypeToDbType(tsType: string): string {
 }
 
 /**
- * Cross-references parsed entities to resolve relationship edges and generate FK columns
+ * Cross-references parsed entities to resolve relationship edges and generate FK columns.
+ * Ensures exactly ONE clean edge per entity pair between tables.
  */
 function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshipEdge[] {
   const edges: EntityRelationshipEdge[] = [];
@@ -411,14 +412,12 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
       const targetEntity = entityMap.get(rel.targetEntity);
 
       if (rel.relationType === 'ManyToOne') {
-        // ManyToOne creates a Foreign Key in source table pointing to target table
         const fkColName = rel.fkColumnName || `${rel.propertyName}Id`;
         let existingCol = sourceEntity.columns.find(
           (c) => c.name === fkColName || c.dbName === fkColName
         );
 
         if (!existingCol) {
-          // Auto create foreign key column representation
           existingCol = {
             id: `fk-${sourceEntity.className}-${fkColName}`,
             name: fkColName,
@@ -448,7 +447,14 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
           };
         }
 
-        edges.push({
+        // Remove any inverse OneToMany edge previously added for this entity pair
+        const existingIdx = edges.findIndex(
+          (e) =>
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
+            (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
+        );
+
+        const newEdge: EntityRelationshipEdge = {
           id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
           sourceEntity: sourceEntity.className,
           sourceColumn: fkColName,
@@ -458,18 +464,22 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
           cardinalityLabel: 'N : 1',
           sourceProperty: rel.propertyName,
           targetProperty: rel.inverseProperty,
-        });
+        };
+
+        if (existingIdx !== -1) {
+          edges[existingIdx] = newEdge;
+        } else {
+          edges.push(newEdge);
+        }
       } else if (rel.relationType === 'OneToMany') {
-        // OneToMany is inverse side of ManyToOne
-        // Only add edge if inverse edge isn't already added to prevent duplicate visual lines
-        const hasExistingManyToOne = edges.some(
+        // Only add OneToMany edge if no ManyToOne or OneToMany edge already exists between these two entities
+        const existingEdge = edges.find(
           (e) =>
-            e.sourceEntity === rel.targetEntity &&
-            e.targetEntity === sourceEntity.className &&
-            e.relationType === 'ManyToOne'
+            (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
+            (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
         );
 
-        if (!hasExistingManyToOne) {
+        if (!existingEdge) {
           edges.push({
             id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
             sourceEntity: sourceEntity.className,
@@ -517,33 +527,40 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
           }
         }
 
-        const edgeExists = edges.some(
+        const existingIdx = edges.findIndex(
           (e) =>
             (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
             (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
         );
 
-        if (!edgeExists) {
-          edges.push({
-            id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
-            sourceEntity: sourceEntity.className,
-            sourceColumn: fkColName,
-            targetEntity: rel.targetEntity,
-            targetColumn: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
-            relationType: 'OneToOne',
-            cardinalityLabel: '1 : 1',
-            sourceProperty: rel.propertyName,
-            targetProperty: rel.inverseProperty,
-          });
+        const oneToOneEdge: EntityRelationshipEdge = {
+          id: `edge-${sourceEntity.className}-${rel.propertyName}-${rel.targetEntity}`,
+          sourceEntity: sourceEntity.className,
+          sourceColumn: isOwner ? fkColName : undefined,
+          targetEntity: rel.targetEntity,
+          targetColumn: targetEntity?.columns.find((c) => c.isPrimary)?.dbName || 'id',
+          relationType: 'OneToOne',
+          cardinalityLabel: '1 : 1',
+          sourceProperty: rel.propertyName,
+          targetProperty: rel.inverseProperty,
+        };
+
+        if (existingIdx !== -1) {
+          // If this relation is the owner side (@JoinColumn), override existing non-owner edge
+          if (isOwner) {
+            edges[existingIdx] = oneToOneEdge;
+          }
+        } else {
+          edges.push(oneToOneEdge);
         }
       } else if (rel.relationType === 'ManyToMany') {
-        const edgeExists = edges.some(
+        const existingEdge = edges.find(
           (e) =>
             (e.sourceEntity === sourceEntity.className && e.targetEntity === rel.targetEntity) ||
             (e.sourceEntity === rel.targetEntity && e.targetEntity === sourceEntity.className)
         );
 
-        if (!edgeExists) {
+        if (!existingEdge) {
           const joinTable =
             rel.joinTableName ||
             `${sourceEntity.tableName}_${(rel.targetEntity).toLowerCase()}`;
@@ -563,7 +580,24 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
     });
   });
 
-  return edges;
+  // Final Strict Deduplication Pass: Ensure max 1 edge per pair of entities
+  const uniqueEdgesMap = new Map<string, EntityRelationshipEdge>();
+
+  edges.forEach((edge) => {
+    const pairKey = [edge.sourceEntity, edge.targetEntity].sort().join('::');
+    const existing = uniqueEdgesMap.get(pairKey);
+
+    if (!existing) {
+      uniqueEdgesMap.set(pairKey, edge);
+    } else {
+      // Favor ManyToOne / owner OneToOne over OneToMany / non-owner
+      if (edge.relationType === 'ManyToOne' || (edge.relationType === 'OneToOne' && edge.sourceColumn)) {
+        uniqueEdgesMap.set(pairKey, edge);
+      }
+    }
+  });
+
+  return Array.from(uniqueEdgesMap.values());
 }
 
 /**
