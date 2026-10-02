@@ -16,6 +16,7 @@ import type { Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
 import type { ParsedEntity, EntityRelationshipEdge } from '../utils/typeormParser';
+import { getEntityColor } from '../utils/colorUtils';
 import { EntityNode } from './EntityNode';
 import { RelationEdge } from './RelationEdge';
 import {
@@ -30,6 +31,7 @@ import {
   Upload,
   Sparkles,
   Layers,
+  Palette,
 } from 'lucide-react';
 
 interface ReactFlowCanvasProps {
@@ -53,7 +55,8 @@ const edgeTypes = {
 function getDagreLayout(
   entities: ParsedEntity[],
   relationshipEdges: EntityRelationshipEdge[],
-  direction: 'TB' | 'LR' = 'TB'
+  direction: 'TB' | 'LR' = 'TB',
+  colorMode: 'table' | 'relation' = 'table'
 ): { nodes: Node[]; edges: Edge[] } {
   const dagreGraph = new dagre.graphlib.Graph();
   dagreGraph.setDefaultEdgeLabel(() => ({}));
@@ -73,11 +76,14 @@ function getDagreLayout(
     return 150 + ent.columns.length * 36;
   };
 
-  entities.forEach((ent) => {
-    const height = calculateNodeHeight(ent);
+  // Build entity color lookup map
+  const entityColorMap = new Map<string, ReturnType<typeof getEntityColor>>();
+  entities.forEach((ent, idx) => {
+    const colorTheme = getEntityColor(ent.className, idx);
+    entityColorMap.set(ent.className, colorTheme);
     dagreGraph.setNode(ent.className, {
       width: isHorizontal ? nodeWidth + 40 : nodeWidth,
-      height: isHorizontal ? height + 20 : height,
+      height: calculateNodeHeight(ent),
     });
   });
 
@@ -87,15 +93,17 @@ function getDagreLayout(
 
   dagre.layout(dagreGraph);
 
-  const nodes: Node[] = entities.map((ent) => {
+  const nodes: Node[] = entities.map((ent, idx) => {
     const nodeWithPosition = dagreGraph.node(ent.className);
     const height = calculateNodeHeight(ent);
+    const colorTheme = entityColorMap.get(ent.className) || getEntityColor(ent.className, idx);
 
     return {
       id: ent.className,
       type: 'entityNode',
       data: {
         entity: ent,
+        colorTheme,
       },
       position: {
         x: nodeWithPosition ? nodeWithPosition.x - nodeWidth / 2 : Math.random() * 400,
@@ -108,9 +116,15 @@ function getDagreLayout(
     const isManyToMany = relEdge.relationType === 'ManyToMany';
     const isOneToOne = relEdge.relationType === 'OneToOne';
 
-    let strokeColor = '#818cf8';
-    if (isManyToMany) strokeColor = '#f472b6';
-    if (isOneToOne) strokeColor = '#38bdf8';
+    // Distinct Table Color Assignment
+    const sourceTheme = entityColorMap.get(relEdge.sourceEntity) || getEntityColor(relEdge.sourceEntity);
+
+    let strokeColor = sourceTheme.stroke;
+    if (colorMode === 'relation') {
+      strokeColor = '#818cf8';
+      if (isManyToMany) strokeColor = '#f472b6';
+      if (isOneToOne) strokeColor = '#38bdf8';
+    }
 
     return {
       id: relEdge.id,
@@ -121,6 +135,10 @@ function getDagreLayout(
         cardinalityLabel: relEdge.cardinalityLabel,
         relationType: relEdge.relationType,
         sourceProperty: relEdge.sourceProperty,
+        edgeColor: strokeColor,
+        edgeTextColor: colorMode === 'table' ? sourceTheme.text : undefined,
+        edgeBgColor: colorMode === 'table' ? sourceTheme.bg : undefined,
+        edgeBorderColor: colorMode === 'table' ? sourceTheme.border : undefined,
       },
       markerEnd: {
         type: MarkerType.ArrowClosed,
@@ -152,11 +170,12 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedRelationFilter, setSelectedRelationFilter] = useState<string>('all');
   const [layoutDirection, setLayoutDirection] = useState<'TB' | 'LR'>('TB');
+  const [colorMode, setColorMode] = useState<'table' | 'relation'>('table');
   const [bgVariant, setBgVariant] = useState<BackgroundVariant>(BackgroundVariant.Dots);
   const { fitView } = useReactFlow();
 
   const applyLayout = useCallback(
-    (direction: 'TB' | 'LR' = layoutDirection) => {
+    (direction: 'TB' | 'LR' = layoutDirection, mode: 'table' | 'relation' = colorMode) => {
       if (entities.length === 0) {
         setNodes([]);
         setEdges([]);
@@ -165,7 +184,8 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
       const { nodes: layoutNodes, edges: layoutEdges } = getDagreLayout(
         entities,
         relationshipEdges,
-        direction
+        direction,
+        mode
       );
       setNodes(layoutNodes);
       setEdges(layoutEdges);
@@ -174,12 +194,12 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         fitView({ padding: 0.2, duration: 400 });
       }, 50);
     },
-    [entities, relationshipEdges, layoutDirection, fitView, setNodes, setEdges]
+    [entities, relationshipEdges, layoutDirection, colorMode, fitView, setNodes, setEdges]
   );
 
   useEffect(() => {
-    applyLayout(layoutDirection);
-  }, [entities, relationshipEdges, layoutDirection, applyLayout]);
+    applyLayout(layoutDirection, colorMode);
+  }, [entities, relationshipEdges, layoutDirection, colorMode, applyLayout]);
 
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
     const ent = entities.find((e) => e.className === node.id);
@@ -189,6 +209,11 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
   const toggleDirection = () => {
     const nextDir = layoutDirection === 'TB' ? 'LR' : 'TB';
     setLayoutDirection(nextDir);
+  };
+
+  const toggleColorMode = () => {
+    const nextMode = colorMode === 'table' ? 'relation' : 'table';
+    setColorMode(nextMode);
   };
 
   const toggleBgVariant = () => {
@@ -223,7 +248,6 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
     return e.data?.relationType === selectedRelationFilter;
   });
 
-  // Empty State Canvas Overlay
   if (entities.length === 0) {
     return (
       <div className="w-full h-full relative bg-slate-950 flex items-center justify-center p-6 select-none">
@@ -284,7 +308,14 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         <Background variant={bgVariant} color="#334155" gap={24} size={1} />
         <Controls className="!bg-slate-900/90 !border-slate-800 !text-slate-200 !rounded-2xl !shadow-2xl overflow-hidden backdrop-blur-md" />
         <MiniMap
-          nodeColor={() => '#6366f1'}
+          nodeColor={(node) => {
+            const ent = node.data?.entity as ParsedEntity;
+            if (ent) {
+              const theme = getEntityColor(ent.className);
+              return theme.stroke;
+            }
+            return '#6366f1';
+          }}
           maskColor="rgba(9, 13, 22, 0.85)"
           className="!bg-slate-900/90 !border-slate-800 !rounded-2xl overflow-hidden shadow-2xl backdrop-blur-md"
         />
@@ -299,7 +330,7 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               placeholder="Search table..."
-              className="bg-transparent border-none outline-none text-slate-200 placeholder-slate-500 w-32 md:w-44 text-xs"
+              className="bg-transparent border-none outline-none text-slate-200 placeholder-slate-500 w-28 md:w-36 text-xs"
             />
           </div>
 
@@ -328,6 +359,16 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
               </option>
             </select>
           </div>
+
+          {/* Color Mode Toggle */}
+          <button
+            onClick={toggleColorMode}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900/90 hover:bg-slate-800 backdrop-blur-md text-xs font-medium text-slate-200 border border-slate-800 rounded-xl shadow-xl transition-all"
+            title="Toggle between Distinct Table Line Colors and Relation Type Colors"
+          >
+            <Palette className="w-3.5 h-3.5 text-amber-400" />
+            <span>{colorMode === 'table' ? 'Colors: Distinct Tables' : 'Colors: Relation Types'}</span>
+          </button>
 
           {/* Layout Direction Toggle */}
           <button
@@ -372,17 +413,37 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         </Panel>
 
         {/* Bottom Right Relation Legend */}
-        <Panel position="bottom-right" className="hidden md:flex items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800 px-3.5 py-1.5 rounded-xl shadow-xl text-[11px] font-mono text-slate-300">
-          <span className="text-slate-400">Legend:</span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-indigo-500"></span> N:1 / 1:N
+        <Panel position="bottom-right" className="hidden md:flex flex-wrap items-center gap-3 bg-slate-900/90 backdrop-blur-md border border-slate-800 px-3.5 py-1.5 rounded-xl shadow-xl text-[11px] font-mono text-slate-300 max-w-xl">
+          <span className="text-slate-400 font-sans font-medium">
+            {colorMode === 'table' ? 'Table Connection Colors:' : 'Relation Type Colors:'}
           </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span> 1:1
-          </span>
-          <span className="flex items-center gap-1">
-            <span className="w-2.5 h-2.5 rounded-full bg-pink-400"></span> N:M
-          </span>
+
+          {colorMode === 'table' ? (
+            entities.slice(0, 6).map((ent, idx) => {
+              const theme = getEntityColor(ent.className, idx);
+              return (
+                <span key={ent.id} className="flex items-center gap-1">
+                  <span
+                    className="w-2.5 h-2.5 rounded-full border"
+                    style={{ backgroundColor: theme.stroke, borderColor: theme.stroke }}
+                  />
+                  <span style={{ color: theme.text }}>{ent.className}</span>
+                </span>
+              );
+            })
+          ) : (
+            <>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-indigo-500"></span> N:1 / 1:N
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-sky-400"></span> 1:1
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded-full bg-pink-400"></span> N:M
+              </span>
+            </>
+          )}
         </Panel>
       </ReactFlow>
     </div>
