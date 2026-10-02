@@ -85,6 +85,12 @@ function parseSingleEntityFile(
   fileName: string,
   fileId: string
 ): ParsedEntity[] {
+  // If the file is a .sql file or contains CREATE TABLE statements, parse as SQL DDL
+  if (fileName.endsWith('.sql') || /CREATE\s+TABLE/i.test(code)) {
+    const sqlEntities = parseSqlDDL(code, fileName, fileId);
+    if (sqlEntities.length > 0) return sqlEntities;
+  }
+
   const resultEntities: ParsedEntity[] = [];
 
   // Remove single line and multi-line comments for easier regex processing
@@ -559,3 +565,160 @@ function resolveEntityRelationships(entities: ParsedEntity[]): EntityRelationshi
 
   return edges;
 }
+
+/**
+ * SQL DDL Schema Parser for .sql files
+ */
+function parseSqlDDL(code: string, fileName: string, fileId: string): ParsedEntity[] {
+  const cleanCode = code
+    .replace(/--.*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+
+  const entities: ParsedEntity[] = [];
+  const createTableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["`]?([A-Za-z0-9_.]+)(?:["`]?))\s*\(([\s\S]*?)\);/gi;
+
+  let match;
+  while ((match = createTableRegex.exec(cleanCode)) !== null) {
+    const rawTableName = match[1].replace(/["`]/g, '');
+    const tableName = rawTableName.includes('.') ? rawTableName.split('.').pop()! : rawTableName;
+    const tableBody = match[2];
+
+    const className = tableName
+      .replace(/^[a-z]/, (c) => c.toUpperCase())
+      .replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+    const columns: ParsedColumn[] = [];
+    const relations: ParsedRelation[] = [];
+    const pkColumns: string[] = [];
+
+    const lines = splitSqlColumns(tableBody);
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      // Table Constraint: PRIMARY KEY (col1, col2)
+      const pkMatch = trimmed.match(/^PRIMARY\s+KEY\s*\(([^)]+)\)/i);
+      if (pkMatch) {
+        const cols = pkMatch[1].split(',').map((c) => c.trim().replace(/["`]/g, ''));
+        pkColumns.push(...cols);
+        continue;
+      }
+
+      // Table Constraint: FOREIGN KEY (col) REFERENCES target_table(target_col)
+      const fkMatch = trimmed.match(/^(?:CONSTRAINT\s+["`]?\w+["`]?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/i);
+      if (fkMatch) {
+        const fkCol = fkMatch[1].trim().replace(/["`]/g, '');
+        const targetTable = fkMatch[2].trim().replace(/["`]/g, '');
+        const targetClass = targetTable.replace(/^[a-z]/, (c) => c.toUpperCase()).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+
+        relations.push({
+          id: `${fileId}-${className}-${fkCol}`,
+          propertyName: fkCol.replace(/_id$/i, ''),
+          relationType: 'ManyToOne',
+          targetEntity: targetClass,
+          fkColumnName: fkCol,
+          isOwner: true,
+        });
+        continue;
+      }
+
+      // Column Definition line: e.g. "id UUID PRIMARY KEY"
+      const colRegex = /^["`]?([A-Za-z0-9_]+)["`]?\s+([A-Za-z0-9_()]+)([\s\S]*)$/i;
+      const colMatch = trimmed.match(colRegex);
+      if (colMatch) {
+        const dbName = colMatch[1];
+        const rawType = colMatch[2];
+        const rest = colMatch[3] || '';
+
+        // Ignore table constraints matched by colRegex
+        if (['PRIMARY', 'FOREIGN', 'CONSTRAINT', 'KEY', 'UNIQUE', 'CHECK'].includes(dbName.toUpperCase())) {
+          continue;
+        }
+
+        const isPrimaryInline = /PRIMARY\s+KEY/i.test(rest);
+        const isNullableInline = !/NOT\s+NULL/i.test(rest) && !isPrimaryInline;
+        const isUniqueInline = /UNIQUE/i.test(rest);
+        const isGeneratedInline = /SERIAL|AUTO_INCREMENT|gen_random_uuid/i.test(rawType + rest);
+
+        const inlineFkMatch = rest.match(/REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/i);
+        if (inlineFkMatch) {
+          const targetTable = inlineFkMatch[1].replace(/["`]/g, '');
+          const targetClass = targetTable.replace(/^[a-z]/, (c) => c.toUpperCase()).replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+          relations.push({
+            id: `${fileId}-${className}-${dbName}`,
+            propertyName: dbName.replace(/_id$/i, ''),
+            relationType: 'ManyToOne',
+            targetEntity: targetClass,
+            fkColumnName: dbName,
+            isOwner: true,
+          });
+        }
+
+        columns.push({
+          id: `${fileId}-${className}-${dbName}`,
+          name: dbName,
+          dbName,
+          type: rawType.toLowerCase(),
+          tsType: mapSqlToTsType(rawType),
+          isPrimary: isPrimaryInline,
+          isGenerated: isGeneratedInline,
+          isNullable: isNullableInline,
+          isUnique: isUniqueInline,
+          isForeignKey: Boolean(inlineFkMatch),
+        });
+      }
+    }
+
+    if (pkColumns.length > 0) {
+      columns.forEach((c) => {
+        if (pkColumns.includes(c.dbName)) {
+          c.isPrimary = true;
+          c.isNullable = false;
+        }
+      });
+    }
+
+    entities.push({
+      id: `${fileId}-${className}`,
+      fileName,
+      className,
+      tableName,
+      columns,
+      relations,
+      rawCode: code,
+    });
+  }
+
+  return entities;
+}
+
+function splitSqlColumns(tableBody: string): string[] {
+  const results: string[] = [];
+  let current = '';
+  let parenDepth = 0;
+
+  for (let i = 0; i < tableBody.length; i++) {
+    const char = tableBody[i];
+    if (char === '(') parenDepth++;
+    else if (char === ')') parenDepth--;
+
+    if (char === ',' && parenDepth === 0) {
+      results.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  if (current.trim()) results.push(current);
+  return results;
+}
+
+function mapSqlToTsType(sqlType: string): string {
+  const lower = sqlType.toLowerCase();
+  if (lower.includes('int') || lower.includes('numeric') || lower.includes('decimal') || lower.includes('float')) return 'number';
+  if (lower.includes('bool')) return 'boolean';
+  if (lower.includes('date') || lower.includes('time')) return 'Date';
+  return 'string';
+}
+
