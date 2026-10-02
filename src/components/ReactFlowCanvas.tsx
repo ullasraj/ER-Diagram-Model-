@@ -198,12 +198,26 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         setEdges([]);
         return;
       }
+
+      // Filter entities & edges to only selected tables if a selection filter is active
+      const activeEntities =
+        selectedTableClasses.length > 0
+          ? entities.filter((e) => selectedTableClasses.includes(e.className))
+          : entities;
+
+      const activeNodeIds = new Set(activeEntities.map((e) => e.className));
+
+      const activeRelationshipEdges = relationshipEdges.filter(
+        (e) => activeNodeIds.has(e.sourceEntity) && activeNodeIds.has(e.targetEntity)
+      );
+
       const { nodes: layoutNodes, edges: layoutEdges } = getDagreLayout(
-        entities,
-        relationshipEdges,
+        activeEntities,
+        activeRelationshipEdges,
         direction,
         mode
       );
+
       setNodes(layoutNodes);
       setEdges(layoutEdges);
 
@@ -211,12 +225,12 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
         fitView({ padding: 0.2, duration: 400 });
       }, 50);
     },
-    [entities, relationshipEdges, layoutDirection, colorMode, fitView, setNodes, setEdges]
+    [entities, relationshipEdges, selectedTableClasses, layoutDirection, colorMode, fitView, setNodes, setEdges]
   );
 
   useEffect(() => {
     applyLayout(layoutDirection, colorMode);
-  }, [entities, relationshipEdges, layoutDirection, colorMode, applyLayout]);
+  }, [entities, relationshipEdges, selectedTableClasses, layoutDirection, colorMode, applyLayout]);
 
   const handleNodeClick = (_: React.MouseEvent, node: Node) => {
     const ent = entities.find((e) => e.className === node.id);
@@ -258,23 +272,14 @@ const ReactFlowInner: React.FC<ReactFlowCanvasProps> = ({
     setSelectedTableClasses([]);
   };
 
-  // Filter nodes based on multi-selected table picker
-  const visibleNodes = nodes.filter((n) => {
-    if (selectedTableClasses.length === 0) return true; // Default: show all
-    return selectedTableClasses.includes(n.id);
-  });
+  // Nodes are already filtered and laid out compactly by applyLayout
+  const visibleNodes = nodes;
 
-  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
-
-  // Filter edges so relationship lines are only shown for visible tables
+  // Filter edges so relationship lines match the selected relation filter
   const visibleEdges = edges.filter((e) => {
     // Edge relation type filter
     if (selectedRelationFilter !== 'all' && e.data?.relationType !== selectedRelationFilter) {
       return false;
-    }
-    // Only display edges connecting selected visible tables
-    if (selectedTableClasses.length > 0) {
-      return visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target);
     }
     return true;
   });
