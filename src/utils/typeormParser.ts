@@ -690,6 +690,99 @@ function parseSqlDDL(code: string, fileName: string, fileId: string): ParsedEnti
     });
   }
 
+  // Parse standalone ALTER TABLE ... FOREIGN KEY ... REFERENCES ...
+  const alterFkRegex = /ALTER\s+TABLE\s+(?:ONLY\s+)?["`]?([A-Za-z0-9_.]+)(?:["`]?)\s+ADD\s+(?:CONSTRAINT\s+["`]?\w+["`]?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+["`]?([A-Za-z0-9_.]+)(?:["`]?)\s*\(([^)]+)\)/gi;
+
+  let alterMatch;
+  while ((alterMatch = alterFkRegex.exec(cleanCode)) !== null) {
+    const sourceTable = alterMatch[1].replace(/["`]/g, '').split('.').pop()!;
+    const fkCol = alterMatch[2].replace(/["`]/g, '').trim();
+    const targetTable = alterMatch[3].replace(/["`]/g, '').split('.').pop()!;
+
+    const sourceEntity = entities.find(
+      (e) =>
+        e.tableName.toLowerCase() === sourceTable.toLowerCase() ||
+        e.className.toLowerCase() === sourceTable.toLowerCase()
+    );
+
+    const targetEntity = entities.find(
+      (e) =>
+        e.tableName.toLowerCase() === targetTable.toLowerCase() ||
+        e.className.toLowerCase() === targetTable.toLowerCase()
+    );
+
+    if (sourceEntity && targetEntity) {
+      const col = sourceEntity.columns.find((c) => c.dbName.toLowerCase() === fkCol.toLowerCase());
+      if (col) {
+        col.isForeignKey = true;
+      }
+
+      const relExists = sourceEntity.relations.some(
+        (r) =>
+          r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() &&
+          r.fkColumnName === fkCol
+      );
+
+      if (!relExists) {
+        sourceEntity.relations.push({
+          id: `${fileId}-${sourceEntity.className}-${fkCol}`,
+          propertyName: fkCol.replace(/_id$/i, ''),
+          relationType: 'ManyToOne',
+          targetEntity: targetEntity.className,
+          fkColumnName: fkCol,
+          isOwner: true,
+        });
+      }
+    }
+  }
+
+  // Auto-infer implied foreign keys from column names (e.g. user_id -> User)
+  entities.forEach((sourceEntity) => {
+    sourceEntity.columns.forEach((col) => {
+      if (col.isPrimary) return;
+
+      const colNameLower = col.dbName.toLowerCase();
+      let inferredTargetName = '';
+
+      if (colNameLower.endsWith('_id')) {
+        inferredTargetName = colNameLower.replace(/_id$/, '');
+      } else if (colNameLower.endsWith('id') && colNameLower.length > 2) {
+        inferredTargetName = colNameLower.substring(0, colNameLower.length - 2);
+      }
+
+      if (inferredTargetName) {
+        const targetEntity = entities.find(
+          (e) =>
+            e !== sourceEntity &&
+            (e.tableName.toLowerCase() === inferredTargetName ||
+              e.tableName.toLowerCase() === `${inferredTargetName}s` ||
+              e.tableName.toLowerCase() === `${inferredTargetName}es` ||
+              e.className.toLowerCase() === inferredTargetName)
+        );
+
+        if (targetEntity) {
+          col.isForeignKey = true;
+          const relExists = sourceEntity.relations.some(
+            (r) =>
+              r.targetEntity.toLowerCase() === targetEntity.className.toLowerCase() &&
+              r.fkColumnName === col.dbName
+          );
+
+          if (!relExists) {
+            sourceEntity.relations.push({
+              id: `${fileId}-${sourceEntity.className}-${col.dbName}`,
+              propertyName: col.dbName.replace(/_id$/i, ''),
+              relationType: 'ManyToOne',
+              targetEntity: targetEntity.className,
+              fkColumnName: col.dbName,
+              isOwner: true,
+            });
+          }
+        }
+      }
+    });
+  });
+
   return entities;
 }
 
